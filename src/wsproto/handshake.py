@@ -504,7 +504,14 @@ def client_extensions_handshake(
         name = accept.split(";", 1)[0].strip()
         for extension in supported:
             if extension.name == name:
-                extension.finalize(accept)
+                try:
+                    extension.finalize(accept)
+                except ValueError as exc:
+                    msg = f"Invalid parameters in response for extension {name}: {exc}"
+                    raise RemoteProtocolError(
+                        msg,
+                        event_hint=RejectConnection(),
+                    ) from exc
                 extensions.append(extension)
                 break
         else:

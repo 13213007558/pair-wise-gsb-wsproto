@@ -50,7 +50,7 @@ class TestPerMessageDeflate:
         },
         {"client_no_context_takeover": True, "server_max_window_bits": 9},
         {"server_no_context_takeover": True, "client_max_window_bits": 9},
-        {"client_max_window_bits": None, "server_max_window_bits": None},
+        {"client_max_window_bits": None},
         {},
     ]
 
@@ -133,13 +133,64 @@ class TestPerMessageDeflate:
 
         assert ext.enabled()
 
-    def test_finalize_ignores_rubbish(self) -> None:
+    def test_finalize_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.finalize("i am the lizard queen; worship me")
+        with pytest.raises(ValueError):
+            ext.finalize("i am the lizard queen; worship me")
 
+        assert not ext.enabled()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            "permessage-deflate; client_no_context_takeoverXXX",
+            "permessage-deflate; client_no_context_takeover=true",
+            "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; client_max_window_bits=",
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; client_max_window_bits=16",
+            "permessage-deflate; client_max_window_bits=abc",
+            "permessage-deflate; server_max_window_bits",
+            "permessage-deflate; server_max_window_bits=8",
+            "permessage-deflate; server_max_window_bits=10; server_max_window_bits=11",
+            "permessage-deflate; unknown_parameter",
+        ],
+    )
+    def test_finalize_rejects_invalid_responses(self, response: str) -> None:
+        ext = wpext.PerMessageDeflate()
+        with pytest.raises(ValueError):
+            ext.finalize(response)
+        assert not ext.enabled()
+
+    def test_finalize_validates_response_against_offer(self) -> None:
+        ext = wpext.PerMessageDeflate(
+            client_max_window_bits=10, server_max_window_bits=10,
+        )
+        ext.offer()
+        with pytest.raises(ValueError, match="client_max_window_bits"):
+            ext.finalize("permessage-deflate; client_max_window_bits=12")
+        assert not ext.enabled()
+
+        ext = wpext.PerMessageDeflate(
+            client_max_window_bits=10, server_max_window_bits=10,
+        )
+        ext.offer()
+        with pytest.raises(ValueError, match="server_max_window_bits"):
+            ext.finalize("permessage-deflate; server_max_window_bits=12")
+        assert not ext.enabled()
+
+        ext = wpext.PerMessageDeflate(
+            client_max_window_bits=10, server_max_window_bits=10,
+        )
+        ext.offer()
+        ext.finalize(
+            "permessage-deflate; client_max_window_bits=9; server_max_window_bits=9",
+        )
         assert ext.enabled()
+        assert ext.client_max_window_bits == 9
+        assert ext.server_max_window_bits == 9
 
     @pytest.mark.parametrize("params", parameter_sets)
     def test_accept(self, params: Params) -> None:
@@ -169,13 +220,69 @@ class TestPerMessageDeflate:
             assert ext.server_max_window_bits == bits
             assert "server_max_window_bits=%d" % bits in response
 
-    def test_accept_ignores_rubbish(self) -> None:
+    def test_accept_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.accept("i am the lizard queen; worship me")
+        assert ext.accept("i am the lizard queen; worship me") is None
 
-        assert ext.enabled()
+        assert not ext.enabled()
+
+    @pytest.mark.parametrize(
+        "offer",
+        [
+            "permessage-deflate; client_no_context_takeoverXXX",
+            "permessage-deflate; client_no_context_takeover=true",
+            "permessage-deflate; client_max_window_bits=",
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; client_max_window_bits=16",
+            "permessage-deflate; client_max_window_bits=abc",
+            "permessage-deflate; server_max_window_bits",
+            "permessage-deflate; server_max_window_bits=8",
+            "permessage-deflate; server_max_window_bits=10; server_max_window_bits=11",
+            "permessage-deflate; unknown_parameter",
+            "permessage-deflate; ",
+        ],
+    )
+    def test_accept_rejects_invalid_offers(self, offer: str) -> None:
+        ext = wpext.PerMessageDeflate()
+        assert ext.accept(offer) is None
+        assert not ext.enabled()
+
+    def test_accept_rejected_offer_does_not_leak_state(self) -> None:
+        ext = wpext.PerMessageDeflate()
+        assert not ext.enabled()
+
+        # The illegal window of 8 makes this offer unacceptable.
+        offer = "permessage-deflate; client_no_context_takeover; client_max_window_bits=8"
+        assert ext.accept(offer) is None
+        assert not ext.enabled()
+        assert not ext.client_no_context_takeover
+
+        # The next offer is negotiated afresh, without any state leaking
+        # in from the rejected offer.
+        response = ext.accept("permessage-deflate")
+        response = cast("str", response)
+        assert "client_no_context_takeover" not in response
+        assert not ext.client_no_context_takeover
+
+    def test_accept_renegotiates_from_local_config(self) -> None:
+        ext = wpext.PerMessageDeflate()
+
+        response = ext.accept(
+            "permessage-deflate; client_no_context_takeover; server_max_window_bits=9",
+        )
+        response = cast("str", response)
+        assert "client_no_context_takeover" in response
+        assert ext.server_max_window_bits == 9
+
+        # A subsequent offer is negotiated afresh from the original local
+        # configuration, not from the previously negotiated state.
+        response = ext.accept("permessage-deflate")
+        response = cast("str", response)
+        assert "client_no_context_takeover" not in response
+        assert not ext.client_no_context_takeover
+        assert ext.server_max_window_bits == 15
 
     def test_inbound_uncompressed_control_frame(self) -> None:
         payload = b"x" * 23
