@@ -8,6 +8,8 @@ import pytest
 
 from wsproto import extensions as wpext
 from wsproto import frame_protocol as fp
+from wsproto.connection import CLIENT, SERVER, Connection
+from wsproto.events import BytesMessage, CloseConnection, Ping, Pong, TextMessage
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -501,3 +503,239 @@ class TestPerMessageDeflate:
     def test_repr(self, params: Params) -> None:
         ext = wpext.PerMessageDeflate(**params)
         self.compare_params_to_string(params, ext, repr(ext))
+
+
+class TestPerMessageDeflateMessageSizeLimit:
+    def make_connections(
+        self, max_message_size: int | None, no_context_takeover: bool,
+    ) -> tuple[Connection, Connection, wpext.PerMessageDeflate]:
+        server_ext = wpext.PerMessageDeflate(
+            client_no_context_takeover=no_context_takeover,
+            max_message_size=max_message_size,
+        )
+        server_ext._enabled = True
+        server = Connection(SERVER, extensions=[server_ext])
+
+        client_ext = wpext.PerMessageDeflate(
+            client_no_context_takeover=no_context_takeover,
+        )
+        client_ext._enabled = True
+        client = Connection(CLIENT, extensions=[client_ext])
+
+        return client, server, server_ext
+
+    @staticmethod
+    def feed_in_slices(
+        server: Connection, wire: bytes | bytearray, slice_size: int = 3,
+    ) -> list:
+        events = []
+        for i in range(0, len(wire), slice_size):
+            server.receive_data(bytes(wire[i : i + slice_size]))
+            events.extend(server.events())
+        return events
+
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_message_exactly_at_limit_is_accepted(
+        self, no_context_takeover: bool,
+    ) -> None:
+        limit = 50
+        client, server, _ = self.make_connections(limit, no_context_takeover)
+
+        wire = client.send(TextMessage("a" * 30, message_finished=False))
+        wire += client.send(TextMessage("b" * 20))
+        events = self.feed_in_slices(server, wire)
+
+        assert not [e for e in events if isinstance(e, CloseConnection)]
+        messages = [e for e in events if isinstance(e, TextMessage)]
+        assert "".join(e.data for e in messages) == "a" * 30 + "b" * 20
+        assert messages[-1].message_finished
+
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_limit_exceeded_at_deflate_tail_with_tiny_slices(
+        self, no_context_takeover: bool,
+    ) -> None:
+        limit = 64
+        client, server, server_ext = self.make_connections(
+            limit, no_context_takeover,
+        )
+
+        # A normal small message first, to establish compression context
+        # when context takeover is enabled.
+        wire = client.send(TextMessage("hello"))
+        events = self.feed_in_slices(server, wire)
+        texts = [e for e in events if isinstance(e, TextMessage)]
+        assert "".join(e.data for e in texts) == "hello"
+
+        # The decompressed message only exceeds the limit with the very
+        # last byte of the deflate stream.
+        payload = b"y" * limit + b"z"
+        wire = client.send(BytesMessage(payload))
+        events = self.feed_in_slices(server, wire, slice_size=1)
+
+        closes = [e for e in events if isinstance(e, CloseConnection)]
+        assert len(closes) == 1
+        assert closes[0].code == fp.CloseReason.MESSAGE_TOO_BIG
+
+        # The application received at most a prefix of the message no
+        # longer than the limit, and never a finished message.
+        messages = [e for e in events if isinstance(e, BytesMessage)]
+        received = b"".join(bytes(e.data) for e in messages)
+        assert len(received) <= limit
+        assert payload.startswith(received)
+        assert not any(e.message_finished for e in messages)
+
+        # The tainted decompression state must not be reused.
+        assert server_ext._decompressor is None
+
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_interleaved_ping_pong_does_not_count_or_reset(
+        self, no_context_takeover: bool,
+    ) -> None:
+        limit = 50
+        client, server, _ = self.make_connections(limit, no_context_takeover)
+
+        wire = client.send(TextMessage("a" * 30, message_finished=False))
+        wire += client.send(Ping(payload=b"12345"))
+        wire += client.send(Pong(payload=b"12345"))
+        wire += client.send(TextMessage("b" * 20))
+        events = self.feed_in_slices(server, wire)
+
+        # The message is exactly at the 50 byte limit; the interleaved
+        # control frames must not count towards it nor reset the count.
+        assert not [e for e in events if isinstance(e, CloseConnection)]
+        pings = [e for e in events if isinstance(e, Ping)]
+        pongs = [e for e in events if isinstance(e, Pong)]
+        assert len(pings) == 1
+        assert pings[0].payload == b"12345"
+        assert len(pongs) == 1
+        messages = [e for e in events if isinstance(e, TextMessage)]
+        assert "".join(e.data for e in messages) == "a" * 30 + "b" * 20
+        assert messages[-1].message_finished
+
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_utf8_multibyte_counts_decompressed_bytes(
+        self, no_context_takeover: bool,
+    ) -> None:
+        limit = 10
+
+        # 5 characters, 10 decompressed bytes: exactly at the limit.
+        client, server, _ = self.make_connections(limit, no_context_takeover)
+        wire = client.send(TextMessage("\u00e9" * 5))
+        events = self.feed_in_slices(server, wire)
+        assert not [e for e in events if isinstance(e, CloseConnection)]
+        texts = [e for e in events if isinstance(e, TextMessage)]
+        assert "".join(e.data for e in texts) == "\u00e9" * 5
+
+        # 6 characters, 12 decompressed bytes: over the limit.
+        client, server, _ = self.make_connections(limit, no_context_takeover)
+        wire = client.send(TextMessage("\u00e9" * 6))
+        events = self.feed_in_slices(server, wire)
+        closes = [e for e in events if isinstance(e, CloseConnection)]
+        assert len(closes) == 1
+        assert closes[0].code == fp.CloseReason.MESSAGE_TOO_BIG
+
+    def test_small_message_delivered_incrementally(self) -> None:
+        client, server, _ = self.make_connections(1000, False)
+
+        text = "hello world, " * 5
+        wire = client.send(TextMessage(text, message_finished=False))
+        wire += client.send(TextMessage("the end"))
+
+        events = []
+        for i in range(len(wire)):
+            server.receive_data(bytes(wire[i : i + 1]))
+            events.extend(server.events())
+
+        assert not [e for e in events if isinstance(e, CloseConnection)]
+        messages = [e for e in events if isinstance(e, TextMessage)]
+        assert "".join(e.data for e in messages) == text + "the end"
+        assert messages[-1].message_finished
+        # Delivery was incremental: more than one non-empty fragment.
+        assert len([e for e in messages if e.data]) > 1
+
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_zip_bomb_rejected_without_full_decompression(
+        self, no_context_takeover: bool,
+    ) -> None:
+        limit = 1024
+        client, server, _ = self.make_connections(limit, no_context_takeover)
+
+        payload = b"z" * 1_000_000
+        wire = client.send(BytesMessage(payload))
+        assert len(wire) < 2000
+
+        server.receive_data(bytes(wire))
+        events = list(server.events())
+
+        closes = [e for e in events if isinstance(e, CloseConnection)]
+        assert len(closes) == 1
+        assert closes[0].code == fp.CloseReason.MESSAGE_TOO_BIG
+        # Nowhere near the full 1MB was decompressed into the application.
+        messages = [e for e in events if isinstance(e, BytesMessage)]
+        assert sum(len(e.data) for e in messages) <= limit
+
+    @pytest.mark.parametrize("client", [True, False])
+    @pytest.mark.parametrize("no_context_takeover", [True, False])
+    def test_decompressor_dropped_after_limit_error(
+        self, client: bool, no_context_takeover: bool,
+    ) -> None:
+        if client:
+            args = {"server_no_context_takeover": no_context_takeover}
+        else:
+            args = {"client_no_context_takeover": no_context_takeover}
+        ext = wpext.PerMessageDeflate(max_message_size=10, **args)
+        ext._enabled = True
+        proto = fp.FrameProtocol(client=client, extensions=[ext])
+
+        result = ext.frame_inbound_header(
+            proto, fp.Opcode.BINARY, fp.RsvBits(True, False, False), 7,
+        )
+        assert isinstance(result, fp.RsvBits)
+        assert ext._decompressor is not None
+
+        # 23 decompressed bytes, over the limit of 10.
+        result2 = ext.frame_inbound_payload_data(proto, b"\xaa\xa8\xc0\n\x00\x00")
+        assert result2 is fp.CloseReason.MESSAGE_TOO_BIG
+        assert ext._decompressor is None
+
+        # A subsequent message starts with a fresh decompressor rather
+        # than reusing the tainted state.
+        result3 = ext.frame_inbound_header(
+            proto, fp.Opcode.BINARY, fp.RsvBits(True, False, False), 0,
+        )
+        assert isinstance(result3, fp.RsvBits)
+        assert ext._decompressor is not None
+
+        compressor = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -15)
+        small = compressor.compress(b"ok") + compressor.flush(zlib.Z_SYNC_FLUSH)
+        result4 = ext.frame_inbound_payload_data(proto, small[:-4])
+        assert result4 == b"ok"
+
+    @pytest.mark.parametrize(
+        "limit,expected_ok",
+        [(23, True), (22, False)],
+    )
+    def test_inbound_message_size_limit(self, limit: int, expected_ok: bool) -> None:
+        payload = b"x" * 23
+        compressed_payload = b"\xaa\xa8\xc0\n\x00\x00"
+
+        ext = wpext.PerMessageDeflate(max_message_size=limit)
+        ext._enabled = True
+        proto = fp.FrameProtocol(client=True, extensions=[ext])
+
+        result = ext.frame_inbound_header(
+            proto,
+            fp.Opcode.BINARY,
+            fp.RsvBits(True, False, False),
+            len(compressed_payload),
+        )
+        assert isinstance(result, fp.RsvBits)
+
+        data = ext.frame_inbound_payload_data(proto, compressed_payload)
+        if expected_ok:
+            assert data == payload
+            assert not isinstance(
+                ext.frame_inbound_complete(proto, True), fp.CloseReason,
+            )
+        else:
+            assert data is fp.CloseReason.MESSAGE_TOO_BIG

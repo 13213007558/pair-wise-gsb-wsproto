@@ -71,9 +71,14 @@ class PerMessageDeflate(Extension):
         client_max_window_bits: int | None = None,
         server_no_context_takeover: bool = False,
         server_max_window_bits: int | None = None,
+        max_message_size: int | None = None,
     ) -> None:
         self.client_no_context_takeover = client_no_context_takeover
         self.server_no_context_takeover = server_no_context_takeover
+        # Local policy limit on the decompressed size of a single inbound
+        # message, accumulated across continuation frames. None means no
+        # limit. This is a local policy and is not negotiated with the peer.
+        self.max_message_size = max_message_size
         self._client_max_window_bits = self.DEFAULT_CLIENT_MAX_WINDOW_BITS
         self._server_max_window_bits = self.DEFAULT_SERVER_MAX_WINDOW_BITS
         if client_max_window_bits is not None:
@@ -89,6 +94,8 @@ class PerMessageDeflate(Extension):
         # frames). Only the first frame in a fragmented message is flagged for
         # compression, so this carries that bit forward.
         self._inbound_compressed: bool | None = None
+        # Decompressed size of the inbound message currently in progress.
+        self._inbound_message_size = 0
 
         self._enabled = False
 
@@ -206,7 +213,14 @@ class PerMessageDeflate(Extension):
 
         self._inbound_is_compressible = self._compressible_opcode(opcode)
 
-        if self._inbound_compressed is None:
+        if self._inbound_is_compressible and opcode is not Opcode.CONTINUATION:
+            # A new message starts here. Interleaved control frames neither
+            # count towards nor reset the decompressed message size.
+            self._inbound_message_size = 0
+
+        # Control frames must not disturb the compression state of an
+        # ongoing (fragmented) message.
+        if self._inbound_is_compressible and self._inbound_compressed is None:
             self._inbound_compressed = rsv.rsv1
             if self._inbound_compressed:
                 assert self._inbound_is_compressible
@@ -219,6 +233,23 @@ class PerMessageDeflate(Extension):
 
         return RsvBits(True, False, False)
 
+    def _decompress_limited(self, data: bytes) -> bytes | CloseReason:
+        assert self._decompressor is not None
+        assert self.max_message_size is not None
+        remaining = self.max_message_size - self._inbound_message_size
+        # Inflate at most one byte past the limit, so that an oversized
+        # message is rejected without decompressing the rest of it into
+        # memory, while a message of exactly the limit is still accepted.
+        result = self._decompressor.decompress(data, remaining + 1)
+        self._inbound_message_size += len(result)
+        if self._inbound_message_size > self.max_message_size:
+            # Drop the tainted decompressor so that its state cannot be
+            # reused by a subsequent message.
+            self._decompressor = None
+            self._inbound_compressed = None
+            return CloseReason.MESSAGE_TOO_BIG
+        return result
+
     def frame_inbound_payload_data(
         self, proto: FrameDecoder | FrameProtocol, data: bytes,
     ) -> bytes | CloseReason:
@@ -227,6 +258,8 @@ class PerMessageDeflate(Extension):
         assert self._decompressor is not None
 
         try:
+            if self.max_message_size is not None:
+                return self._decompress_limited(bytes(data))
             return self._decompressor.decompress(bytes(data))
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA
@@ -237,7 +270,6 @@ class PerMessageDeflate(Extension):
         if not fin:
             return None
         if not self._inbound_is_compressible:
-            self._inbound_compressed = None
             return None
         if not self._inbound_compressed:
             self._inbound_compressed = None
@@ -245,7 +277,13 @@ class PerMessageDeflate(Extension):
         assert self._decompressor is not None
 
         try:
-            data = self._decompressor.decompress(b"\x00\x00\xff\xff")
+            if self.max_message_size is not None:
+                result = self._decompress_limited(b"\x00\x00\xff\xff")
+                if isinstance(result, CloseReason):
+                    return result
+                data = result
+            else:
+                data = self._decompressor.decompress(b"\x00\x00\xff\xff")
             data += self._decompressor.flush()
         except zlib.error:
             return CloseReason.INVALID_FRAME_PAYLOAD_DATA

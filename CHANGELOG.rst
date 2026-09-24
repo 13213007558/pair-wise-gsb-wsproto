@@ -4,6 +4,11 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+ - Add ``max_message_size`` to ``PerMessageDeflate`` to limit the
+   decompressed size of a received message (accumulated across
+   continuation frames). Messages exceeding the limit are rejected with
+   a 1009 (message too big) close without being decompressed in full.
+
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 
