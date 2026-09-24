@@ -4,6 +4,9 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add an RFC 8441 HTTP/2 handshake entry point that connects extended
+  CONNECT negotiation to the WebSocket frame layer without using the
+  HTTP/1.1 101 or Sec-WebSocket-Key exchange.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 

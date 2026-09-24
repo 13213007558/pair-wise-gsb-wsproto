@@ -80,45 +80,76 @@ connection to be managed before the WebSocket connection with
 `Hyper-h2 <https://python-hyper.org/h2>`_ being recommended for
 HTTP/2.
 
-Although `wsproto` doesn't manage the HTTP/2 connection it can still
-be used for the WebSocket stream. The HTTP/2 connection will need to
-handshake the WebSocket stream, with the key being agreement on the
-extensions used. Once the extensions have been agreed the
-:class:`Connection <wsproto.connection.Connection>` class can be used
-to manage the WebSocket connection, noting that data to be sent or
-received will need to be parsed by the HTTP/2 connection first. In
-practice for a server this looks like,
+Although `wsproto` doesn't manage the HTTP/2 connection it provides an
+RFC 8441 handshake entry point and the WebSocket frame layer. The HTTP/2
+implementation remains responsible for HTTP/2 frames, stream state, flow
+control, and the ``SETTINGS_ENABLE_CONNECT_PROTOCOL`` setting.
+
+For a server, pass the parsed extended CONNECT headers to
+:class:`H2Handshake <wsproto.handshake.H2Handshake>`. Then select the
+subprotocol and extensions from the request and call ``accept``. The
+returned headers do not include ``:status``; prepend a 2xx status and
+send them with hyper-h2. RFC 8441 does not use a 101 response,
+``Sec-WebSocket-Key``, or ``Sec-WebSocket-Accept``.
 
 .. code-block:: python
 
-     from wsproto.connection import Connection, ConnectionType
-     from wsproto.extensions import PerMessageDeflate
-     from wsproto.handshake import server_extensions_handshake
-
-     # WebSocket request has been received
-     request_extensions: List[str]
-     supported_extensions = [PerMessageDeflate()]
-     accepts = server_extensions_handshake(request_extensions, supported_extensions)
-     if accepts:
-         response_headers.append({"sec-websocket-extensions": accepts})
-     # Send the response headers
-     connection = Connection(ConnectionType.SERVER, supported_extensions)
-
-and for a client
-
-.. code-block:: python
-
-    from wsproto.connection import Connection, ConnectionType
+    from wsproto.connection import ConnectionType
+    from wsproto.events import AcceptConnection
     from wsproto.extensions import PerMessageDeflate
-    from wsproto.handshake import client_extensions_handshake
+    from wsproto.handshake import H2Handshake
 
-    # WebSocket response has been received
-    accepted_extensions: List[str]
-    proposed_extensions = [PerMessageDeflate()]
-    extensions = client_extensions_handshake(accepted_extensions, proposed_extensions)
-    connection = Connection(ConnectionType.CLIENT, supported_extensions)
+    handshake = H2Handshake(ConnectionType.SERVER)
+    request = handshake.receive_headers(request_headers)
+    extension = PerMessageDeflate()
+    response_headers = handshake.accept(
+        AcceptConnection(subprotocol="chat", extensions=[extension]),
+    )
+    h2_connection.send_headers(
+        stream_id,
+        [(b":status", b"200")] + response_headers,
+    )
+    websocket = handshake.connection
 
-any data received on the stream should be passed to the ``connection``
-via the ``receive_bytes`` method and bytes returned from the
-``connection.send`` method should be wrapped in a HTTP/2 data frame
-and sent.
+For a client, build the extended CONNECT headers with
+``initiate_connection``. The client may send WebSocket DATA after a 2xx
+response has been received and passed to ``receive_headers``. The server
+may send WebSocket DATA after it has sent the 2xx response headers. The
+request and response HEADERS must not carry ``END_STREAM`` when the
+WebSocket is expected to remain open.
+
+.. code-block:: python
+
+    from wsproto.connection import ConnectionType
+    from wsproto.events import Request
+    from wsproto.extensions import PerMessageDeflate
+    from wsproto.handshake import H2Handshake
+
+    handshake = H2Handshake(ConnectionType.CLIENT)
+    request_headers = handshake.initiate_connection(
+        Request(
+            host="example.com",
+            target="/chat",
+            subprotocols=["chat"],
+            extensions=[PerMessageDeflate()],
+        ),
+    )
+    h2_connection.send_headers(stream_id, request_headers)
+    # After h2 emits ResponseReceived:
+    accepted = handshake.receive_headers(response_headers)
+    websocket = handshake.connection
+
+Any DATA received on the HTTP/2 stream should be passed to
+``websocket.receive_data``, and bytes returned by ``websocket.send``
+should be wrapped in HTTP/2 DATA frames.
+
+HTTP/2 stream termination is transport termination, not a WebSocket
+Close frame. When hyper-h2 emits ``StreamEnded`` (the peer's
+``END_STREAM``), pass ``None`` to ``websocket.receive_data``. If no
+WebSocket Close frame was received first, wsproto reports the underlying
+EOF as ``CloseConnection`` with code 1006 (abnormal closure). When
+hyper-h2 emits ``StreamReset`` (``RST_STREAM``), surface an exception
+such as ``ConnectionResetError`` in the application glue and discard the
+stream. Do not synthesize a normal WebSocket Close frame, and in
+particular do not invent close code 1000, for either ``END_STREAM`` or
+``RST_STREAM``.

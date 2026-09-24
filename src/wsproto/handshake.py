@@ -37,6 +37,19 @@ WEBSOCKET_VERSION = b"13"
 # RFC6455, Section 4.2.1/3 - Value of the Upgrade header
 WEBSOCKET_UPGRADE = b"websocket"
 
+# RFC 8441 extends CONNECT with a protocol. WebSocket data is only carried on
+# the HTTP/2 stream after a 2xx response has been sent or received.
+H2_WEBSOCKET_PROTOCOL = WEBSOCKET_UPGRADE
+
+# These headers belong to the HTTP/1.1 Upgrade handshake. RFC 8441 replaces
+# them with the extended CONNECT pseudo-headers and a 2xx response.
+_H2_FORBIDDEN_HEADERS = {
+    b"connection",
+    b"sec-websocket-accept",
+    b"sec-websocket-key",
+    b"upgrade",
+}
+
 
 class H11Handshake:
     """A Handshake implementation for HTTP/1.1 connections."""
@@ -452,6 +465,319 @@ class H11Handshake:
         self._state = ConnectionState.OPEN
         return AcceptConnection(
             extensions=extensions, extra_headers=headers, subprotocol=subprotocol,
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(client={self.client}, state={self.state})"
+
+
+class H2Handshake:
+    """
+    A handshake implementation for WebSockets over HTTP/2 (RFC 8441).
+
+    This class is HTTP/2-parser agnostic: callers are responsible for using a
+    library such as hyper-h2 to send and receive the HTTP/2 frames. The header
+    blocks passed to and returned by this class contain only HTTP headers, not
+    serialized HTTP/2 frames.
+
+    A client starts with :meth:`initiate_connection`, then passes the response
+    headers to :meth:`receive_headers`. A server passes the request headers to
+    :meth:`receive_headers`, then calls :meth:`accept` with the subprotocol and
+    extensions actually selected during negotiation. The accepted values are
+    checked against the values offered in the request.
+
+    RFC 8441 uses a 2xx response, not 101 Switching Protocols, and does not
+    use Sec-WebSocket-Key or Sec-WebSocket-Accept.
+    """
+
+    def __init__(self, connection_type: ConnectionType) -> None:
+        self.client = connection_type is ConnectionType.CLIENT
+        self._state = ConnectionState.CONNECTING
+        self._connection: Connection | None = None
+        self._initiating_request: Request | None = None
+
+    @property
+    def state(self) -> ConnectionState:
+        return self._state
+
+    @property
+    def connection(self) -> Connection | None:
+        """Return the established WebSocket frame connection, if any."""
+        return self._connection
+
+    def initiate_connection(
+        self,
+        request: Request,
+        scheme: str = "https",
+    ) -> Headers:
+        """
+        Return the headers for an extended CONNECT request.
+
+        The returned headers must be sent on a new HTTP/2 stream without
+        END_STREAM. WebSocket DATA may be sent by the client after a 2xx
+        response has been received and processed by :meth:receive_headers.
+
+        :param request: The WebSocket request to negotiate.
+        :param scheme: The HTTP scheme to place in the :scheme pseudo-header.
+        :returns: HTTP/2 request headers, including pseudo-headers.
+        """
+        if not self.client:
+            msg = "Cannot initiate an extended CONNECT when acting as the server"
+            raise LocalProtocolError(msg)
+        if self._state is not ConnectionState.CONNECTING:
+            msg = f"Cannot initiate a connection in state {self._state}"
+            raise LocalProtocolError(msg)
+
+        headers: Headers = [
+            (b":method", b"CONNECT"),
+            (b":protocol", H2_WEBSOCKET_PROTOCOL),
+            (b":scheme", scheme.encode("ascii")),
+            (b":authority", request.host.encode("idna")),
+            (b":path", request.target.encode("ascii")),
+            (b"sec-websocket-version", WEBSOCKET_VERSION),
+        ]
+
+        if request.subprotocols:
+            headers.append(
+                (
+                    b"sec-websocket-protocol",
+                    (", ".join(request.subprotocols)).encode("ascii"),
+                ),
+            )
+
+        if request.extensions:
+            offers: dict[str, str | bool] = {}
+            for extension in request.extensions:
+                if not isinstance(extension, Extension):
+                    msg = "Client extension offers must be Extension instances"
+                    raise LocalProtocolError(msg)
+                offers[extension.name] = extension.offer()
+            extensions = []
+            for extension_name, params in offers.items():
+                name_bytes = extension_name.encode("ascii")
+                if isinstance(params, bool):
+                    if params:
+                        extensions.append(name_bytes)
+                else:
+                    extensions.append(b"%s; %s" % (name_bytes, params.encode("ascii")))
+            if extensions:
+                headers.append((b"sec-websocket-extensions", b", ".join(extensions)))
+
+        for name, value in request.extra_headers:
+            normalized_name = name.lower()
+            if normalized_name.startswith(b":") or normalized_name in _H2_FORBIDDEN_HEADERS:
+                msg = f"Header {name!r} cannot be used in an extended CONNECT request"
+                raise LocalProtocolError(msg)
+            headers.append((normalized_name, value))
+
+        self._initiating_request = request
+        return headers
+
+    def receive_headers(self, headers: Headers) -> Request | AcceptConnection:
+        """
+        Process an HTTP/2 header block received from the peer.
+
+        On a server this processes the extended CONNECT request and returns a
+        :class:`~wsproto.events.Request`. On a client this processes the 2xx
+        response and returns an :class:`~wsproto.events.AcceptConnection`.
+        """
+        if self.client:
+            return self._process_connection_response(headers)
+        return self._process_connection_request(headers)
+
+    def accept(self, event: AcceptConnection) -> Headers:
+        """
+        Accept a received extended CONNECT request.
+
+        The returned headers contain the negotiated WebSocket parameters and
+        any extra headers from event. The caller must prepend an appropriate
+        :status pseudo-header with a 2xx value and send the headers without
+        END_STREAM. The server may send WebSocket DATA once those response
+        headers have been sent.
+
+        :param event: The subprotocol and extensions actually selected for the
+            connection.
+        :returns: HTTP/2 response headers, excluding :status.
+        """
+        if self.client:
+            msg = "Cannot accept an extended CONNECT when acting as the client"
+            raise LocalProtocolError(msg)
+        if self._state is not ConnectionState.CONNECTING:
+            msg = f"Connection cannot be accepted in state {self._state}"
+            raise LocalProtocolError(msg)
+        if self._initiating_request is None:
+            msg = "Cannot accept before receiving an extended CONNECT request"
+            raise LocalProtocolError(msg)
+
+        request = self._initiating_request
+        if event.subprotocol is not None and event.subprotocol not in request.subprotocols:
+            msg = f"unexpected subprotocol {event.subprotocol}"
+            raise LocalProtocolError(msg)
+
+        headers: Headers = []
+        if event.subprotocol is not None:
+            headers.append(
+                (b"sec-websocket-protocol", event.subprotocol.encode("ascii")),
+            )
+
+        if event.extensions:
+            if not all(isinstance(offer, str) for offer in request.extensions):
+                msg = "Server extension offers must be header strings"
+                raise LocalProtocolError(msg)
+            accepts = server_extensions_handshake(
+                cast("Sequence[str]", request.extensions),
+                event.extensions,
+            )
+            accepted_names = set()
+            if accepts is not None:
+                accepted_names = {accept.split(";", 1)[0].strip() for accept in split_comma_header(accepts)}
+            expected_names = {extension.name for extension in event.extensions}
+            if accepted_names != expected_names:
+                msg = "accepted extensions must be selected from the request offers"
+                raise LocalProtocolError(msg)
+            assert accepts is not None
+            headers.append((b"sec-websocket-extensions", accepts))
+
+        headers.extend(event.extra_headers)
+        self._connection = Connection(ConnectionType.SERVER, event.extensions)
+        self._state = ConnectionState.OPEN
+        return headers
+
+    def _process_connection_request(self, headers: Headers) -> Request:
+        if self._state is not ConnectionState.CONNECTING:
+            msg = f"Cannot receive a request in state {self._state}"
+            raise LocalProtocolError(msg)
+
+        authority = None
+        extensions: list[str] = []
+        host = None
+        method = None
+        path = None
+        protocol = None
+        scheme = None
+        subprotocols: list[str] = []
+        version = None
+        extra_headers: Headers = []
+
+        for name, value in headers:
+            name = name.lower()
+            if name == b":authority":
+                authority = value.decode("idna")
+            elif name == b":method":
+                method = value
+            elif name == b":path":
+                path = value
+            elif name == b":protocol":
+                protocol = value
+            elif name == b":scheme":
+                scheme = value
+            elif name == b"host":
+                host = value.decode("idna")
+            elif name == b"sec-websocket-extensions":
+                extensions.extend(split_comma_header(value))
+            elif name == b"sec-websocket-protocol":
+                subprotocols.extend(split_comma_header(value))
+            elif name == b"sec-websocket-version":
+                version = value
+            elif name in _H2_FORBIDDEN_HEADERS:
+                msg = f"Header {name!r} cannot be used with RFC 8441 WebSockets"
+                raise RemoteProtocolError(msg, event_hint=RejectConnection())
+            else:
+                extra_headers.append((name, value))
+
+        if method != b"CONNECT":
+            msg = "Request method must be CONNECT"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if protocol != H2_WEBSOCKET_PROTOCOL:
+            msg = "Missing pseudo-header, ':protocol: websocket'"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if scheme is None:
+            msg = "Missing pseudo-header, ':scheme'"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if path is None:
+            msg = "Missing pseudo-header, ':path'"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if version != WEBSOCKET_VERSION:
+            msg = "Missing header, 'Sec-WebSocket-Version'"
+            raise RemoteProtocolError(
+                msg,
+                event_hint=RejectConnection(
+                    headers=[(b"Sec-WebSocket-Version", WEBSOCKET_VERSION)],
+                    status_code=426 if version else 400,
+                ),
+            )
+
+        request_host = authority if authority is not None else host
+        if request_host is None:
+            msg = "Missing pseudo-header, ':authority'"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+
+        self._initiating_request = Request(
+            extensions=extensions,
+            extra_headers=extra_headers,
+            host=request_host,
+            subprotocols=subprotocols,
+            target=path.decode("ascii"),
+        )
+        return self._initiating_request
+
+    def _process_connection_response(self, headers: Headers) -> AcceptConnection:
+        if self._state is not ConnectionState.CONNECTING:
+            msg = f"Cannot receive a response in state {self._state}"
+            raise LocalProtocolError(msg)
+        if self._initiating_request is None:
+            msg = "Cannot receive a response before initiating a connection"
+            raise LocalProtocolError(msg)
+
+        accepts: list[str] = []
+        status_code = None
+        subprotocol = None
+        extra_headers: Headers = []
+
+        for name, value in headers:
+            name = name.lower()
+            if name == b":status":
+                status_code = int(value)
+            elif name == b"sec-websocket-extensions":
+                accepts.extend(split_comma_header(value))
+            elif name == b"sec-websocket-protocol":
+                subprotocol = value.decode("ascii")
+            elif name in _H2_FORBIDDEN_HEADERS:
+                msg = f"Header {name!r} cannot be used with RFC 8441 WebSockets"
+                raise RemoteProtocolError(msg, event_hint=RejectConnection())
+            else:
+                extra_headers.append((name, value))
+
+        if status_code is None:
+            msg = "Missing pseudo-header, ':status'"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if status_code == 101:
+            msg = "HTTP/2 WebSockets must not use 101 Switching Protocols"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+        if not 200 <= status_code < 300:
+            msg = f"Extended CONNECT rejected with status {status_code}"
+            raise RemoteProtocolError(
+                msg,
+                event_hint=RejectConnection(
+                    headers=extra_headers,
+                    status_code=status_code,
+                    has_body=True,
+                ),
+            )
+        if subprotocol is not None and subprotocol not in self._initiating_request.subprotocols:
+            msg = f"unrecognized subprotocol {subprotocol}"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection())
+
+        extensions = client_extensions_handshake(
+            accepts,
+            cast("Sequence[Extension]", self._initiating_request.extensions),
+        )
+        self._connection = Connection(ConnectionType.CLIENT, extensions)
+        self._state = ConnectionState.OPEN
+        return AcceptConnection(
+            extensions=extensions,
+            extra_headers=extra_headers,
+            subprotocol=subprotocol,
         )
 
     def __repr__(self) -> str:

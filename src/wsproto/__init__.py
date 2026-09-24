@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .connection import Connection, ConnectionState, ConnectionType
-from .handshake import H11Handshake
+from .handshake import H2Handshake, H11Handshake
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -97,4 +97,4 @@ class WSConnection:
             yield from self.connection.events()
 
 
-__all__ = ("ConnectionType", "WSConnection")
+__all__ = ("ConnectionType", "H2Handshake", "WSConnection")
