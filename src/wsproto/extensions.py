@@ -10,7 +10,9 @@ import zlib
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from .events import RejectConnection
 from .frame_protocol import CloseReason, FrameDecoder, FrameProtocol, Opcode, RsvBits
+from .utilities import RemoteProtocolError
 
 
 class Extension(ABC):
@@ -92,6 +94,17 @@ class PerMessageDeflate(Extension):
 
         self._enabled = False
 
+        # Snapshot of the original local configuration. Every candidate
+        # offer is negotiated afresh from these values so that a rejected
+        # (or previously accepted) candidate cannot leak state into the
+        # negotiation of a subsequent candidate.
+        self._local_config = (
+            self.client_no_context_takeover,
+            self._client_max_window_bits,
+            self.server_no_context_takeover,
+            self._server_max_window_bits,
+        )
+
     @property
     def client_max_window_bits(self) -> int:
         return self._client_max_window_bits
@@ -134,63 +147,172 @@ class PerMessageDeflate(Extension):
         return "; ".join(parameters)
 
     def finalize(self, offer: str) -> None:
-        bits = [b.strip() for b in offer.split(";")]
-        for bit in bits[1:]:
-            if bit.startswith("client_no_context_takeover"):
-                self.client_no_context_takeover = True
-            elif bit.startswith("server_no_context_takeover"):
-                self.server_no_context_takeover = True
-            elif bit.startswith("client_max_window_bits"):
-                self.client_max_window_bits = int(bit.split("=", 1)[1].strip())
-            elif bit.startswith("server_max_window_bits"):
-                self.server_max_window_bits = int(bit.split("=", 1)[1].strip())
+        # `offer` is the server's response to the offer we made; it must be
+        # validated against the parameters we originally offered (RFC 7692,
+        # Section 7.1) before it is applied.
+        client_no_context_takeover = False
+        server_no_context_takeover = False
+        client_max_window_bits = self.client_max_window_bits
+        server_max_window_bits = self.server_max_window_bits
 
+        try:
+            for name, value in self._parse_params(offer).items():
+                if name == "client_no_context_takeover":
+                    if value is not None:
+                        msg = f"Extension parameter {name} must not have a value"
+                        raise ValueError(msg)
+                    # A server may always request this, even if the offer did
+                    # not include it (RFC 7692, Section 7.1.1.2).
+                    client_no_context_takeover = True
+                elif name == "server_no_context_takeover":
+                    if value is not None:
+                        msg = f"Extension parameter {name} must not have a value"
+                        raise ValueError(msg)
+                    if not self.server_no_context_takeover:
+                        msg = f"Response includes {name} but it was not offered"
+                        raise ValueError(msg)
+                    server_no_context_takeover = True
+                elif name == "client_max_window_bits":
+                    bits = self._parse_window_bits(name, value)
+                    if bits > self.client_max_window_bits:
+                        msg = (
+                            f"Response {name}={bits} exceeds the offered"
+                            f" {self.client_max_window_bits}"
+                        )
+                        raise ValueError(msg)
+                    client_max_window_bits = bits
+                elif name == "server_max_window_bits":
+                    bits = self._parse_window_bits(name, value)
+                    if bits > self.server_max_window_bits:
+                        msg = (
+                            f"Response {name}={bits} exceeds the offered"
+                            f" {self.server_max_window_bits}"
+                        )
+                        raise ValueError(msg)
+                    server_max_window_bits = bits
+                else:
+                    msg = f"Unknown extension parameter: {name}"
+                    raise ValueError(msg)
+        except ValueError as error:
+            msg = f"Invalid permessage-deflate response: {error}"
+            raise RemoteProtocolError(msg, event_hint=RejectConnection()) from error
+
+        self.client_no_context_takeover = client_no_context_takeover
+        self.server_no_context_takeover = server_no_context_takeover
+        self._client_max_window_bits = client_max_window_bits
+        self._server_max_window_bits = server_max_window_bits
         self._enabled = True
 
-    def _parse_params(self, params: str) -> tuple[int | None, int | None]:
-        client_max_window_bits = None
-        server_max_window_bits = None
+    def _parse_params(self, params: str) -> dict[str, str | None]:
+        """
+        Split an extension parameter string into name/value pairs.
 
+        Parameter names must match exactly, and each parameter may appear at
+        most once. Raises ValueError otherwise.
+        """
+        parsed: dict[str, str | None] = {}
         bits = [b.strip() for b in params.split(";")]
         for bit in bits[1:]:
-            if bit.startswith("client_no_context_takeover"):
-                self.client_no_context_takeover = True
-            elif bit.startswith("server_no_context_takeover"):
-                self.server_no_context_takeover = True
-            elif bit.startswith("client_max_window_bits"):
-                if "=" in bit:
-                    client_max_window_bits = int(bit.split("=", 1)[1].strip())
-                else:
-                    client_max_window_bits = self.client_max_window_bits
-            elif bit.startswith("server_max_window_bits"):
-                if "=" in bit:
-                    server_max_window_bits = int(bit.split("=", 1)[1].strip())
-                else:
-                    server_max_window_bits = self.server_max_window_bits
+            name, separator, value = bit.partition("=")
+            name = name.strip()
+            if not name or name in parsed:
+                msg = f"Invalid or duplicate extension parameter: {bit!r}"
+                raise ValueError(msg)
+            parsed[name] = value.strip() if separator else None
+        return parsed
 
-        return client_max_window_bits, server_max_window_bits
+    @staticmethod
+    def _parse_window_bits(name: str, value: str | None) -> int:
+        if value is None:
+            msg = f"Extension parameter {name} requires a value"
+            raise ValueError(msg)
+        try:
+            bits = int(value)
+        except ValueError:
+            msg = f"Invalid value for extension parameter {name}: {value!r}"
+            raise ValueError(msg) from None
+        if bits < 9 or bits > 15:
+            msg = f"Invalid value for extension parameter {name}: {value!r}"
+            raise ValueError(msg)
+        return bits
+
+    def _parse_offer(self, offer: str) -> dict[str, int | bool | None]:
+        """
+        Parse and validate an offer's parameters per RFC 7692.
+
+        Raises ValueError if the offer is invalid and must be declined.
+        """
+        parsed: dict[str, int | bool | None] = {}
+        for name, value in self._parse_params(offer).items():
+            if name in ("client_no_context_takeover", "server_no_context_takeover"):
+                if value is not None:
+                    msg = f"Extension parameter {name} must not have a value"
+                    raise ValueError(msg)
+                parsed[name] = True
+            elif name == "client_max_window_bits":
+                # A valueless client_max_window_bits in an offer means the
+                # client supports any window size (RFC 7692, Section 7.1.2.2).
+                parsed[name] = (
+                    None if value is None else self._parse_window_bits(name, value)
+                )
+            elif name == "server_max_window_bits":
+                # A server_max_window_bits offer must include a value
+                # (RFC 7692, Section 7.1.2.1).
+                parsed[name] = self._parse_window_bits(name, value)
+            else:
+                msg = f"Unknown extension parameter: {name}"
+                raise ValueError(msg)
+        return parsed
 
     def accept(self, offer: str) -> bool | None | str:
-        client_max_window_bits, server_max_window_bits = self._parse_params(offer)
+        try:
+            params = self._parse_offer(offer)
+        except ValueError:
+            # Decline invalid offers (RFC 7692, Section 7.1).
+            return None
+
+        # Negotiate each candidate afresh from the original local
+        # configuration so that state from other candidates cannot leak
+        # into this negotiation.
+        (
+            client_no_context_takeover,
+            client_max_window_bits,
+            server_no_context_takeover,
+            server_max_window_bits,
+        ) = self._local_config
+
+        # A server may always request client_no_context_takeover, even if
+        # the offer did not include it (RFC 7692, Section 7.1.1.2).
+        client_no_context_takeover = (
+            client_no_context_takeover or "client_no_context_takeover" in params
+        )
+        # A response must not include server_no_context_takeover unless the
+        # offer included it (RFC 7692, Section 7.1.1.1).
+        server_no_context_takeover = "server_no_context_takeover" in params
 
         parameters = []
-
-        if self.client_no_context_takeover:
+        if client_no_context_takeover:
             parameters.append("client_no_context_takeover")
-        if self.server_no_context_takeover:
+        if server_no_context_takeover:
             parameters.append("server_no_context_takeover")
-        try:
-            if client_max_window_bits is not None:
-                parameters.append(f"client_max_window_bits={client_max_window_bits}")
-                self.client_max_window_bits = client_max_window_bits
-            if server_max_window_bits is not None:
-                parameters.append(f"server_max_window_bits={server_max_window_bits}")
-                self.server_max_window_bits = server_max_window_bits
-        except ValueError:
-            return None
-        else:
-            self._enabled = True
-            return "; ".join(parameters)
+
+        if "client_max_window_bits" in params:
+            offered = params["client_max_window_bits"]
+            if offered is not None:
+                client_max_window_bits = min(offered, client_max_window_bits)
+            parameters.append(f"client_max_window_bits={client_max_window_bits}")
+        if "server_max_window_bits" in params:
+            offered = params["server_max_window_bits"]
+            assert offered is not None
+            server_max_window_bits = min(offered, server_max_window_bits)
+            parameters.append(f"server_max_window_bits={server_max_window_bits}")
+
+        self.client_no_context_takeover = client_no_context_takeover
+        self.server_no_context_takeover = server_no_context_takeover
+        self._client_max_window_bits = client_max_window_bits
+        self._server_max_window_bits = server_max_window_bits
+        self._enabled = True
+        return "; ".join(parameters)
 
     def frame_inbound_header(
         self,

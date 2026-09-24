@@ -8,6 +8,7 @@ import pytest
 
 from wsproto import extensions as wpext
 from wsproto import frame_protocol as fp
+from wsproto.utilities import RemoteProtocolError
 
 if TYPE_CHECKING:
     from typing import TypedDict
@@ -50,7 +51,7 @@ class TestPerMessageDeflate:
         },
         {"client_no_context_takeover": True, "server_max_window_bits": 9},
         {"server_no_context_takeover": True, "client_max_window_bits": 9},
-        {"client_max_window_bits": None, "server_max_window_bits": None},
+        {"client_max_window_bits": None},
         {},
     ]
 
@@ -108,17 +109,12 @@ class TestPerMessageDeflate:
 
     @pytest.mark.parametrize("params", parameter_sets)
     def test_finalize(self, params: Params) -> None:
-        ext = wpext.PerMessageDeflate()
+        offered = {key: value for key, value in params.items() if value is not None}
+        ext = wpext.PerMessageDeflate(**offered)
         assert not ext.enabled()
 
-        if "client_max_window_bits" in params:
-            if params["client_max_window_bits"] is None:
-                del params["client_max_window_bits"]
-        if "server_max_window_bits" in params:
-            if params["server_max_window_bits"] is None:
-                del params["server_max_window_bits"]
-        offer = self.make_offer_string(params)
-        ext.finalize(offer)
+        response = self.make_offer_string(offered)
+        ext.finalize(response)
 
         if params.get("client_max_window_bits", None):
             assert ext.client_max_window_bits == params["client_max_window_bits"]
@@ -133,12 +129,64 @@ class TestPerMessageDeflate:
 
         assert ext.enabled()
 
-    def test_finalize_ignores_rubbish(self) -> None:
+    def test_finalize_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.finalize("i am the lizard queen; worship me")
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize("i am the lizard queen; worship me")
 
+        assert not ext.enabled()
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            # server_no_context_takeover was not offered
+            "permessage-deflate; server_no_context_takeover",
+            # Response parameters must include a value
+            "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; server_max_window_bits",
+            # Not a number (must not leak an int() exception)
+            "permessage-deflate; client_max_window_bits=abc",
+            # Out of range window sizes
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; server_max_window_bits=16",
+            # Parameters may not be repeated
+            "permessage-deflate; server_max_window_bits=10; server_max_window_bits=12",
+            # Unknown parameters are not allowed
+            "permessage-deflate; client_no_context_takeoverXXX",
+            # Flag parameters must not have a value
+            "permessage-deflate; client_no_context_takeover=yes",
+        ],
+    )
+    def test_finalize_rejects_invalid_response(self, response: str) -> None:
+        ext = wpext.PerMessageDeflate()
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize(response)
+        assert not ext.enabled()
+
+    def test_finalize_rejects_larger_window_than_offered(self) -> None:
+        ext = wpext.PerMessageDeflate(
+            client_max_window_bits=10, server_max_window_bits=10,
+        )
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize(
+                "permessage-deflate; client_max_window_bits=12"
+                "; server_max_window_bits=10",
+            )
+        with pytest.raises(RemoteProtocolError):
+            ext.finalize(
+                "permessage-deflate; client_max_window_bits=10"
+                "; server_max_window_bits=12",
+            )
+        assert not ext.enabled()
+
+    def test_finalize_allows_unoffered_client_no_context_takeover(self) -> None:
+        # A server may always request client_no_context_takeover, even if the
+        # offer did not include it (RFC 7692, Section 7.1.1.2).
+        ext = wpext.PerMessageDeflate()
+        ext.finalize("permessage-deflate; client_no_context_takeover")
+        assert ext.client_no_context_takeover
         assert ext.enabled()
 
     @pytest.mark.parametrize("params", parameter_sets)
@@ -169,13 +217,71 @@ class TestPerMessageDeflate:
             assert ext.server_max_window_bits == bits
             assert "server_max_window_bits=%d" % bits in response
 
-    def test_accept_ignores_rubbish(self) -> None:
+    def test_accept_rejects_rubbish(self) -> None:
         ext = wpext.PerMessageDeflate()
         assert not ext.enabled()
 
-        ext.accept("i am the lizard queen; worship me")
+        assert ext.accept("i am the lizard queen; worship me") is None
 
+        assert not ext.enabled()
+
+    @pytest.mark.parametrize(
+        "offer",
+        [
+            # Misspelled parameter names must not be treated as valid ones
+            "permessage-deflate; client_no_context_takeoverXXX",
+            "permessage-deflate; server_max_window_bitsX=10",
+            "permessage-deflate; unknown_parameter",
+            # Parameters may not be repeated
+            "permessage-deflate; server_no_context_takeover; server_no_context_takeover",
+            "permessage-deflate; client_max_window_bits=10; client_max_window_bits=12",
+            # server_max_window_bits offers must include a value
+            "permessage-deflate; server_max_window_bits",
+            # Not a number (must not leak an int() exception)
+            "permessage-deflate; client_max_window_bits=abc",
+            # Out of range window sizes
+            "permessage-deflate; client_max_window_bits=8",
+            "permessage-deflate; server_max_window_bits=16",
+            # Flag parameters must not have a value
+            "permessage-deflate; client_no_context_takeover=yes",
+        ],
+    )
+    def test_accept_declines_invalid_offers(self, offer: str) -> None:
+        ext = wpext.PerMessageDeflate()
+        assert ext.accept(offer) is None
+        assert not ext.enabled()
+
+    def test_accept_rejected_candidate_does_not_leak_state(self) -> None:
+        ext = wpext.PerMessageDeflate()
+
+        # This candidate is declined because a window of 8 is not supported.
+        offer = "permessage-deflate; client_no_context_takeover; client_max_window_bits=8"
+        assert ext.accept(offer) is None
+        assert not ext.enabled()
+
+        # The next candidate is negotiated from the original local
+        # configuration, so nothing from the rejected candidate may leak.
+        response = ext.accept("permessage-deflate")
+        response = cast("str", response)
+        assert "client_no_context_takeover" not in response
+        assert not ext.client_no_context_takeover
+        assert ext.client_max_window_bits == ext.DEFAULT_CLIENT_MAX_WINDOW_BITS
         assert ext.enabled()
+
+    def test_accept_each_candidate_uses_original_config(self) -> None:
+        ext = wpext.PerMessageDeflate()
+
+        response = ext.accept("permessage-deflate; server_no_context_takeover")
+        response = cast("str", response)
+        assert "server_no_context_takeover" in response
+        assert ext.server_no_context_takeover
+
+        # A subsequent candidate is negotiated afresh, so the previously
+        # accepted parameters do not leak into the new response.
+        response = ext.accept("permessage-deflate")
+        response = cast("str", response)
+        assert "server_no_context_takeover" not in response
+        assert not ext.server_no_context_takeover
 
     def test_inbound_uncompressed_control_frame(self) -> None:
         payload = b"x" * 23
