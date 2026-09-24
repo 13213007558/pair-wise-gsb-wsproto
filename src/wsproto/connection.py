@@ -136,6 +136,11 @@ class Connection:
         :type data: ``bytes``
         """
         if data is None:
+            if self._state is ConnectionState.CLOSED:
+                # The closing handshake already completed, so the end of
+                # the underlying stream (e.g. an HTTP/2 END_STREAM) is
+                # expected and carries no further meaning.
+                return
             # "If _The WebSocket Connection is Closed_ and no Close control
             # frame was received by the endpoint (such as could occur if the
             # underlying transport connection is lost), _The WebSocket

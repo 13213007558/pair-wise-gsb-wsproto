@@ -363,20 +363,11 @@ class H11Handshake:
             )
 
         if request.extensions:
-            offers: dict[str, str | bool] = {}
-            for e in request.extensions:
-                assert isinstance(e, Extension)
-                offers[e.name] = e.offer()
-            extensions = []
-            for name, params in offers.items():
-                bname = name.encode("ascii")
-                if isinstance(params, bool):
-                    if params:
-                        extensions.append(bname)
-                else:
-                    extensions.append(b"%s; %s" % (bname, params.encode("ascii")))
-            if extensions:
-                headers.append((b"Sec-WebSocket-Extensions", b", ".join(extensions)))
+            offers = _extension_offers(
+                cast("Sequence[Extension]", request.extensions),
+            )
+            if offers:
+                headers.append((b"Sec-WebSocket-Extensions", offers))
 
         upgrade = h11.Request(
             method=b"GET",
@@ -456,6 +447,402 @@ class H11Handshake:
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(client={self.client}, state={self.state})"
+
+
+class H2Handshake:
+    """
+    A Handshake implementation for RFC 8441 WebSockets (over HTTP/2).
+
+    This handshake performs no I/O of its own: the HTTP/2 layer (for
+    example the `h2` package) owns the connection and the streams.
+    This class validates the extended CONNECT exchange, produces the
+    header blocks the HTTP/2 layer should send, and then hands off to a
+    frame-layer :class:`~wsproto.connection.Connection` available via
+    :attr:`connection`.
+
+    Unlike :class:`H11Handshake` there is no 101 (Switching Protocols)
+    response and no `Sec-WebSocket-Key`/`Sec-WebSocket-Accept`
+    exchange: the extended CONNECT request and a 2xx response are
+    sufficient to establish the connection, so those headers are neither
+    generated nor required (RFC 8441, Section 4).
+
+    The flow is:
+
+    *Client*: call :meth:`send` with a :class:`~wsproto.events.Request`
+    and pass the returned headers to the HTTP/2 layer (e.g.
+    `h2.send_headers`). When the response headers arrive, pass them to
+    :meth:`receive_headers`; an
+    :class:`~wsproto.events.AcceptConnection` (or
+    :class:`~wsproto.events.RejectConnection`) event is emitted.
+
+    *Server*: pass the CONNECT request headers to
+    :meth:`receive_headers`; a :class:`~wsproto.events.Request` event is
+    emitted. Call :meth:`send` with an
+    :class:`~wsproto.events.AcceptConnection` and pass the returned
+    headers (including `:status: 200`) to the HTTP/2 layer.
+
+    When each side may send data (RFC 8441, Section 5):
+
+    * The client may send WebSocket frames (as HTTP/2 DATA frames) as
+      soon as it has sent the CONNECT request headers; it does not have
+      to wait for the response. Note that wsproto only exposes the
+      frame-layer :attr:`connection` once the 2xx response has been
+      processed, because extension negotiation is not final before
+      then.
+    * The server may send WebSocket frames once it has passed the 2xx
+      response headers to the HTTP/2 layer, and must be prepared to
+      receive client DATA frames that were sent before the response
+      arrived (the HTTP/2 layer buffers them on the stream).
+
+    Stream termination:
+
+    * An HTTP/2 `END_STREAM` flag is the end of the byte stream: feed
+      it to the frame layer as `connection.receive_data(None)`. If the
+      WebSocket closing handshake already completed this is a no-op;
+      otherwise the connection closes abnormally and a
+      :class:`~wsproto.events.CloseConnection` event with code 1006
+      (abnormal closure) is emitted.
+    * An HTTP/2 `RST_STREAM` is an abnormal transport failure, not a
+      WebSocket close. It should be surfaced to the application as an
+      error (and the frame layer torn down with
+      `connection.receive_data(None)`, again yielding close code
+      1006). wsproto never fabricates a normal WebSocket Close frame
+      (code 1000) for either signal.
+    """
+
+    def __init__(self, connection_type: ConnectionType) -> None:
+        self.client = connection_type is ConnectionType.CLIENT
+        self._state = ConnectionState.CONNECTING
+        self._connection: Connection | None = None
+        self._events: deque[Event] = deque()
+        self._initiating_request: Request | None = None
+
+    @property
+    def state(self) -> ConnectionState:
+        return self._state
+
+    @property
+    def connection(self) -> Connection | None:
+        """
+        Return the established frame-layer connection.
+
+        This returns None if the handshake has not yet completed.
+
+        :rtype: wsproto.connection.Connection or None
+        """
+        return self._connection
+
+    def send(self, event: Event) -> Headers:
+        """
+        Generate a header block for the HTTP/2 layer to send.
+
+        As a client, send a :class:`~wsproto.events.Request` to generate
+        the extended CONNECT request headers. As a server, send an
+        :class:`~wsproto.events.AcceptConnection` to generate the 2xx
+        response headers.
+
+        Unlike :meth:`H11Handshake.send` this returns a list of headers,
+        not bytes: the HTTP/2 layer is responsible for encoding and
+        sending them (e.g. with `h2.send_headers`).
+
+        :returns: Headers to send via the HTTP/2 layer.
+        :rtype: list of (name, value) tuples
+        """
+        if isinstance(event, Request):
+            return self._initiate_connection(event)
+        if isinstance(event, AcceptConnection):
+            return self._accept(event)
+        msg = f"Event {event} cannot be sent during the handshake"
+        raise LocalProtocolError(
+            msg,
+        )
+
+    def receive_headers(self, headers: Headers) -> None:
+        """
+        Process a header block received from the HTTP/2 layer.
+
+        As a server, pass the extended CONNECT request headers here; as
+        a client, pass the response headers. Any resulting events (a
+        :class:`~wsproto.events.Request`,
+        :class:`~wsproto.events.AcceptConnection`, or
+        :class:`~wsproto.events.RejectConnection`) can be retrieved with
+        :meth:`events`.
+
+        :param list headers: HTTP/2 headers as a list of 2-tuples,
+            including the pseudo-headers (`:method`, `:protocol`,
+            ... for requests, `:status` for responses).
+        """
+        if self._state is not ConnectionState.CONNECTING:
+            msg = f"Cannot receive headers in state {self._state}"
+            raise LocalProtocolError(
+                msg,
+            )
+        normed = [(name.lower(), value) for name, value in headers]
+        if self.client:
+            self._process_response_headers(normed)
+        else:
+            self._events.append(self._process_request_headers(normed))
+
+    def events(self) -> Generator[Event, None, None]:
+        """
+        Return a generator that provides any events that have been
+        generated by protocol activity.
+
+        :returns: a generator that yields events.
+        """
+        while self._events:
+            yield self._events.popleft()
+
+    # Server mode methods
+
+    def _process_request_headers(self, headers: Headers) -> Request:
+        # RFC 8441, Section 4 - the extended CONNECT request. Note that
+        # no Sec-WebSocket-Key is required (or used) here.
+        normed = normed_header_dict(headers)
+
+        if normed.get(b":method") != b"CONNECT":
+            msg = "Request method must be CONNECT"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        if normed.get(b":protocol") != WEBSOCKET_UPGRADE:
+            msg = f"Missing pseudo-header, ':protocol: {WEBSOCKET_UPGRADE.decode()}'"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        if normed.get(b":scheme") is None:
+            msg = "Missing pseudo-header, ':scheme'"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        target = normed.get(b":path")
+        if target is None:
+            msg = "Missing pseudo-header, ':path'"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        authority = normed.get(b":authority")
+        if authority is None:
+            msg = "Missing pseudo-header, ':authority'"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        version = normed.get(b"sec-websocket-version")
+        if version != WEBSOCKET_VERSION:
+            msg = "Missing header, 'Sec-WebSocket-Version'"
+            raise RemoteProtocolError(
+                msg,
+                event_hint=RejectConnection(
+                    headers=[(b"Sec-WebSocket-Version", WEBSOCKET_VERSION)],
+                    status_code=426 if version else 400,
+                ),
+            )
+
+        subprotocols: list[str] = []
+        if b"sec-websocket-protocol" in normed:
+            subprotocols = split_comma_header(normed[b"sec-websocket-protocol"])
+        extensions: list[str] = []
+        if b"sec-websocket-extensions" in normed:
+            extensions = split_comma_header(normed[b"sec-websocket-extensions"])
+
+        extra_headers = [
+            (name, value)
+            for name, value in headers
+            if not name.startswith(b":")
+            and name not in (b"sec-websocket-extensions", b"sec-websocket-protocol")
+        ]
+
+        self._initiating_request = Request(
+            extensions=extensions,
+            extra_headers=extra_headers,
+            host=authority.decode("idna"),
+            subprotocols=subprotocols,
+            target=target.decode("ascii"),
+        )
+        return self._initiating_request
+
+    def _accept(self, event: AcceptConnection) -> Headers:
+        if self.client:
+            msg = "Cannot accept a connection when acting as the client"
+            raise LocalProtocolError(
+                msg,
+            )
+        if self._initiating_request is None:
+            msg = "Cannot accept a connection before a request has been received"
+            raise LocalProtocolError(
+                msg,
+            )
+
+        headers: Headers = [(b":status", b"200")]
+
+        if event.subprotocol is not None:
+            if event.subprotocol not in self._initiating_request.subprotocols:
+                msg = f"unexpected subprotocol {event.subprotocol}"
+                raise LocalProtocolError(msg)
+            headers.append(
+                (b"sec-websocket-protocol", event.subprotocol.encode("ascii")),
+            )
+
+        if event.extensions:
+            accepts = server_extensions_handshake(
+                cast("Sequence[str]", self._initiating_request.extensions),
+                event.extensions,
+            )
+            if accepts:
+                headers.append((b"sec-websocket-extensions", accepts))
+
+        self._connection = Connection(ConnectionType.SERVER, event.extensions)
+        self._state = ConnectionState.OPEN
+        return headers + event.extra_headers
+
+    # Client mode methods
+
+    def _initiate_connection(self, request: Request) -> Headers:
+        if not self.client:
+            msg = "Cannot initiate a connection when acting as the server"
+            raise LocalProtocolError(
+                msg,
+            )
+        if self._initiating_request is not None:
+            msg = "A connection has already been initiated"
+            raise LocalProtocolError(
+                msg,
+            )
+        self._initiating_request = request
+
+        scheme = b"https"
+        extra_headers = []
+        for name, value in request.extra_headers:
+            if name.lower() == b":scheme":
+                scheme = value
+            else:
+                extra_headers.append((name, value))
+
+        headers: Headers = [
+            (b":method", b"CONNECT"),
+            (b":protocol", WEBSOCKET_UPGRADE),
+            (b":scheme", scheme),
+            (b":path", request.target.encode("ascii")),
+            (b":authority", request.host.encode("idna")),
+            (b"sec-websocket-version", WEBSOCKET_VERSION),
+        ]
+
+        if request.subprotocols:
+            headers.append(
+                (
+                    b"sec-websocket-protocol",
+                    (", ".join(request.subprotocols)).encode("ascii"),
+                ),
+            )
+
+        if request.extensions:
+            offers = _extension_offers(
+                cast("Sequence[Extension]", request.extensions),
+            )
+            if offers:
+                headers.append((b"sec-websocket-extensions", offers))
+
+        return headers + extra_headers
+
+    def _process_response_headers(self, headers: Headers) -> None:
+        if self._initiating_request is None:
+            msg = "Received response headers before a request was sent"
+            raise LocalProtocolError(
+                msg,
+            )
+        normed = normed_header_dict(headers)
+
+        status = normed.get(b":status")
+        if status is None:
+            msg = "Missing pseudo-header, ':status'"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            )
+        try:
+            status_code = int(status)
+        except ValueError:
+            msg = f"Bad status code {status!r}"
+            raise RemoteProtocolError(
+                msg, event_hint=RejectConnection(),
+            ) from None
+
+        extra_headers = [
+            (name, value)
+            for name, value in headers
+            if not name.startswith(b":")
+            and name not in (b"sec-websocket-extensions", b"sec-websocket-protocol")
+        ]
+
+        if not 200 <= status_code < 300:
+            # The handshake was rejected. Any response body is delivered
+            # by the HTTP/2 layer as DATA frames on this stream; wsproto
+            # does not model it.
+            self._events.append(
+                RejectConnection(
+                    headers=extra_headers,
+                    status_code=status_code,
+                    has_body=True,
+                ),
+            )
+            self._state = ConnectionState.CLOSED
+            return
+
+        subprotocol = normed.get(b"sec-websocket-protocol")
+        accepted_subprotocol = (
+            subprotocol.decode("ascii") if subprotocol is not None else None
+        )
+        if (
+            accepted_subprotocol is not None
+            and accepted_subprotocol not in self._initiating_request.subprotocols
+        ):
+            msg = f"unrecognized subprotocol {accepted_subprotocol}"
+            raise RemoteProtocolError(
+                msg,
+                event_hint=RejectConnection(),
+            )
+
+        accepts: list[str] = []
+        if b"sec-websocket-extensions" in normed:
+            accepts = split_comma_header(normed[b"sec-websocket-extensions"])
+        extensions = client_extensions_handshake(
+            accepts, cast("Sequence[Extension]", self._initiating_request.extensions),
+        )
+
+        self._connection = Connection(ConnectionType.CLIENT, extensions)
+        self._state = ConnectionState.OPEN
+        self._events.append(
+            AcceptConnection(
+                extensions=extensions,
+                extra_headers=extra_headers,
+                subprotocol=accepted_subprotocol,
+            ),
+        )
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(client={self.client}, state={self.state})"
+
+
+def _extension_offers(extensions: Sequence[Extension]) -> bytes | None:
+    """
+    Build a Sec-WebSocket-Extensions header value offering the extensions.
+
+    This returns None if there are no extensions to offer.
+    """
+    offers: dict[str, str | bool] = {}
+    for extension in extensions:
+        assert isinstance(extension, Extension)
+        offers[extension.name] = extension.offer()
+    if not offers:
+        return None
+    values = []
+    for name, params in offers.items():
+        name_bytes = name.encode("ascii")
+        if isinstance(params, bool):
+            if params:
+                values.append(name_bytes)
+        else:
+            values.append(b"%s; %s" % (name_bytes, params.encode("ascii")))
+    return b", ".join(values) if values else None
 
 
 def server_extensions_handshake(

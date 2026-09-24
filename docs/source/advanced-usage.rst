@@ -122,3 +122,19 @@ any data received on the stream should be passed to the ``connection``
 via the ``receive_bytes`` method and bytes returned from the
 ``connection.send`` method should be wrapped in a HTTP/2 data frame
 and sent.
+
+Alternatively the :class:`H2Handshake <wsproto.handshake.H2Handshake>`
+class performs the RFC 8441 handshake validation for you: it checks
+the extended CONNECT request (no ``Sec-WebSocket-Key`` is required and
+no 101 response is generated), validates that the accepted subprotocol
+and extensions were actually offered, and hands off to the frame
+layer. The client may send WebSocket frames as soon as it has sent the
+CONNECT request headers; the server may send frames once it has sent
+the 2xx response headers and must tolerate client frames that arrive
+earlier. An HTTP/2 ``END_STREAM`` on the stream should be passed to
+the connection as ``connection.receive_data(None)`` (a no-op if the
+closing handshake already completed, otherwise an abnormal closure
+with code 1006); an HTTP/2 ``RST_STREAM`` is an abnormal transport
+failure and should be surfaced as an error, never as a normal
+WebSocket Close frame. See ``example/h2_extended_connect.py`` for a
+complete in-memory example using Hyper-h2.

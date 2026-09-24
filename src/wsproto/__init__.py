@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .connection import Connection, ConnectionState, ConnectionType
-from .handshake import H11Handshake
+from .handshake import H11Handshake, H2Handshake
 
 if TYPE_CHECKING:
     from collections.abc import Generator

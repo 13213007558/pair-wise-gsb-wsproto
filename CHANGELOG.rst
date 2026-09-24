@@ -4,6 +4,14 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add ``wsproto.handshake.H2Handshake``, an RFC 8441 (WebSockets over
+  HTTP/2) handshake. It validates the extended CONNECT exchange without
+  a 101 response or ``Sec-WebSocket-Key`` and hands off to the frame
+  layer. See ``example/h2_extended_connect.py`` for an in-memory h2 +
+  wsproto example.
+- ``Connection.receive_data(None)`` is now a no-op if the closing
+  handshake already completed, so an HTTP/2 ``END_STREAM`` after a
+  clean close does not produce a spurious abnormal-closure event.
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 
