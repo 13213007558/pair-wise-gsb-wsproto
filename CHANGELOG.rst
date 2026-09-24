@@ -6,6 +6,11 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add ``max_decompressed_message_size`` to ``PerMessageDeflate`` to
+  limit the decompressed size of received messages. Messages exceeding
+  the limit are rejected with close code 1009 (MESSAGE_TOO_BIG).
+- Fix permessage-deflate decompression state being reset by ping/pong
+  frames interleaved within a fragmented message.
 
 1.3.2 (2025-11-20)
 ------------------
