@@ -6,6 +6,12 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Add an optional server-side ``OriginPolicy`` that strictly parses the
+  ``Origin`` and ``Host`` headers and admits handshakes against an explicit
+  set of trusted origins before the ``Request`` event is emitted. A denial
+  follows the normal HTTP rejection flow and never reflects the untrusted
+  value or opens a WebSocket connection. Client connections cannot take a
+  policy.
 
 1.3.2 (2025-11-20)
 ------------------

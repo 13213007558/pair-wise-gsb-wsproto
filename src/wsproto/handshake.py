@@ -17,6 +17,7 @@ import h11
 from .connection import Connection, ConnectionState, ConnectionType
 from .events import AcceptConnection, Event, RejectConnection, RejectData, Request
 from .extensions import Extension
+from .origin import OriginPolicy, enforce_origin_policy
 from .utilities import (
     LocalProtocolError,
     RemoteProtocolError,
@@ -41,9 +42,18 @@ WEBSOCKET_UPGRADE = b"websocket"
 class H11Handshake:
     """A Handshake implementation for HTTP/1.1 connections."""
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        origin_policy: OriginPolicy | None = None,
+    ) -> None:
         self.client = connection_type is ConnectionType.CLIENT
         self._state = ConnectionState.CONNECTING
+
+        if origin_policy is not None and self.client:
+            msg = "an OriginPolicy only applies to a server connection"
+            raise LocalProtocolError(msg)
+        self._origin_policy = origin_policy
 
         if self.client:
             self._h11_connection = h11.Connection(h11.CLIENT)
@@ -200,7 +210,9 @@ class H11Handshake:
         connection_tokens = None
         extensions: list[str] = []
         host = None
+        host_raw: bytes | None = None
         key = None
+        origin_values: list[bytes] = []
         subprotocols: list[str] = []
         upgrade = b""
         version = None
@@ -211,7 +223,10 @@ class H11Handshake:
                 connection_tokens = split_comma_header(value)
             elif name == b"host":
                 host = value.decode("idna")
+                host_raw = value
                 continue  # Skip appending to headers
+            elif name == b"origin":
+                origin_values.append(value)
             elif name == b"sec-websocket-extensions":
                 extensions.extend(split_comma_header(value))
                 continue  # Skip appending to headers
@@ -257,6 +272,10 @@ class H11Handshake:
             raise RemoteProtocolError(
                 msg, event_hint=RejectConnection(),
             )
+
+        if self._origin_policy is not None:
+            assert host_raw is not None
+            enforce_origin_policy(self._origin_policy, origin_values, host_raw)
 
         self._initiating_request = Request(
             extensions=extensions,

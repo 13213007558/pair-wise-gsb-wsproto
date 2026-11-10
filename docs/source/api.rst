@@ -45,6 +45,41 @@ Handshake
 
 .. autofunction:: wsproto.handshake.server_extensions_handshake
 
+Origin admission
+----------------
+
+A server can attach an :class:`~wsproto.origin.OriginPolicy` to its
+connection. The policy parses the incoming ``Origin`` and ``Host`` headers
+strictly and runs before the :class:`~wsproto.events.Request` event is
+emitted, so a denied handshake keeps the normal HTTP rejection flow and never
+opens a WebSocket. Matching is structural over scheme, host and port; raw
+string suffix matching is never used.
+
+.. autoclass:: wsproto.origin.OriginPolicy
+   :members:
+
+.. autoclass:: wsproto.origin.ParsedOrigin
+   :members:
+
+.. autoclass:: wsproto.origin.ParsedHost
+   :members:
+
+.. autofunction:: wsproto.origin.parse_origin
+
+.. autofunction:: wsproto.origin.parse_host
+
+.. autofunction:: wsproto.origin.enforce_origin_policy
+
+.. autoclass:: wsproto.origin.OriginPolicyError
+    :members:
+
+.. autoclass:: wsproto.origin.MissingOriginError
+.. autoclass:: wsproto.origin.NullOriginError
+.. autoclass:: wsproto.origin.MultipleOriginsError
+.. autoclass:: wsproto.origin.InvalidOriginError
+.. autoclass:: wsproto.origin.UntrustedOriginError
+.. autoclass:: wsproto.origin.InvalidHostError
+
 Events
 ------
 

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 from .connection import Connection, ConnectionState, ConnectionType
 from .handshake import H11Handshake
+from .origin import OriginPolicy
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -25,15 +26,22 @@ class WSConnection:
     Represents the local end of a WebSocket connection to a remote peer.
     """
 
-    def __init__(self, connection_type: ConnectionType) -> None:
+    def __init__(
+        self,
+        connection_type: ConnectionType,
+        origin_policy: OriginPolicy | None = None,
+    ) -> None:
         """
         Constructor
 
         :param wsproto.connection.ConnectionType connection_type: Controls
             whether the library behaves as a client or as a server.
+        :param wsproto.origin.OriginPolicy origin_policy: Optional server-side
+            admission policy applied to the ``Origin`` header of an incoming
+            handshake. A client connection cannot take a policy.
         """
         self.client = connection_type is ConnectionType.CLIENT
-        self.handshake = H11Handshake(connection_type)
+        self.handshake = H11Handshake(connection_type, origin_policy=origin_policy)
         self.connection: Connection | None = None
 
     @property

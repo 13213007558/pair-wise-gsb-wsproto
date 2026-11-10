@@ -152,6 +152,56 @@ receiving a ``Request`` event.
 For a more complete example, see `synchronous_server.py
 <https://github.com/python-hyper/wsproto/blob/main/example/synchronous_server.py>`_.
 
+Origin admission policy
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Browsers identify the page opening a WebSocket with an ``Origin`` header.
+Instead of repeating that check in every application, pass an
+:class:`wsproto.origin.OriginPolicy` to the server connection::
+
+    from wsproto.origin import OriginPolicy
+
+    policy = OriginPolicy(
+        allowed_origins=[
+            "https://example.com",
+            "https://app.example.com:8443",
+        ],
+        # Non-browser clients may omit Origin; the normal WebSocket
+        # handshake checks (key, version, Upgrade, ...) still apply.
+        allow_missing_origin=True,
+        allow_null_origin=False,
+    )
+    ws = WSConnection(ConnectionType.SERVER, origin_policy=policy)
+
+Each trusted entry is a *complete* origin. The policy parses the incoming
+``Origin`` and ``Host`` values strictly and then compares scheme, host and
+port structurally, so ``https://example.com.evil.com``,
+``http://example.com`` or ``https://sub.example.com`` are not admitted by a
+trust entry of ``https://example.com``. Default ports normalize away
+(``https://x:443`` equals ``https://x``) and IPv6 literals are canonicalized.
+
+The special cases are configured separately: a missing header, the literal
+``null`` origin, repeated header lines and syntax errors are each distinct
+failures. Two ``Origin`` header lines are never merged into one trusted
+source. When the policy denies a handshake, wsproto raises a
+:class:`~wsproto.utilities.RemoteProtocolError` whose
+``event_hint`` is a fixed ``403`` :class:`RejectConnection
+<wsproto.events.RejectConnection>`; the untrusted value is never reflected in
+the response and no WebSocket connection is created::
+
+    try:
+        ws.receive_data(data)
+    except RemoteProtocolError as exc:
+        sock.send(ws.send(exc.event_hint))
+
+Because the policy runs *before* the :class:`Request
+<wsproto.events.Request>` event is emitted, per-session resources should be
+allocated only while handling that event, after admission has succeeded. A
+client connection cannot take an origin policy. See
+`origin_policy_server.py
+<https://github.com/python-hyper/wsproto/blob/main/example/origin_policy_server.py>`_
+for a runnable example.
+
 Protocol Errors
 ---------------
 
