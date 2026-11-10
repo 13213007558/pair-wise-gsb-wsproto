@@ -45,6 +45,56 @@ Handshake
 
 .. autofunction:: wsproto.handshake.server_extensions_handshake
 
+HTTP/2 (RFC 8441)
+-----------------
+
+:class:`~wsproto.h2.H2Handshake` bootstraps WebSockets over HTTP/2 using the
+RFC 8441 extended CONNECT exchange. It is independent of any concrete HTTP/2
+library and never opens a socket: the owning transport converts its frames
+into the structured :class:`~wsproto.h2.H2Event` subclasses and feeds them in
+through :meth:`~wsproto.h2.H2Handshake.receive_event`, while outbound
+instructions (HEADERS, DATA, RST_STREAM) are returned as the same kind of
+structured events. HTTP/2 flow control stays the caller's responsibility.
+Once the handshake succeeds a regular
+:class:`~wsproto.connection.Connection` performs the WebSocket framing, and
+each stream owns an independent adapter, so ending or resetting one stream
+never affects the others.
+
+.. autoclass:: wsproto.h2.H2Handshake
+   :members:
+
+.. autoclass:: wsproto.h2.H2Event
+   :members:
+
+.. autoclass:: wsproto.h2.H2Request
+   :members:
+
+.. autoclass:: wsproto.h2.H2Response
+   :members:
+
+.. autoclass:: wsproto.h2.H2Data
+   :members:
+
+.. autoclass:: wsproto.h2.H2EndStream
+   :members:
+
+.. autoclass:: wsproto.h2.H2Reset
+   :members:
+
+.. autoclass:: wsproto.h2.H2SendHeaders
+   :members:
+
+.. autoclass:: wsproto.h2.H2SendData
+   :members:
+
+.. autoclass:: wsproto.h2.H2ResetStream
+   :members:
+
+.. autoclass:: wsproto.h2.H2ErrorCode
+   :members:
+
+.. autodata:: wsproto.h2.ENABLE_CONNECT_PROTOCOL
+
 Events
 ------
 

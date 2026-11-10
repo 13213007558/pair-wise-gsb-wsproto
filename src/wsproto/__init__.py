@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .connection import Connection, ConnectionState, ConnectionType
+from .h2 import H2Handshake
 from .handshake import H11Handshake
 
 if TYPE_CHECKING:
@@ -97,4 +98,4 @@ class WSConnection:
             yield from self.connection.events()
 
 
-__all__ = ("ConnectionType", "WSConnection")
+__all__ = ("ConnectionType", "H2Handshake", "WSConnection")

@@ -57,6 +57,12 @@ class Request(Event):
 
        A list of the subprotocols proposed in the request, as a list
        of strings.
+
+    .. attribute:: scheme
+
+       The URI scheme, used as the ``:scheme`` pseudo-header by RFC 8441
+       extended CONNECT requests. Defaults to ``https`` and is unused by the
+       HTTP/1.1 handshake.
     """
 
     host: str
@@ -64,6 +70,9 @@ class Request(Event):
     extensions: Sequence[Extension] | Sequence[str] = field(default_factory=list)
     extra_headers: Headers = field(default_factory=list)
     subprotocols: list[str] = field(default_factory=list)
+    #: The ``:scheme`` pseudo-header used by RFC 8441 extended CONNECT.
+    #: The HTTP/1.1 handshake ignores this field.
+    scheme: str = "https"
 
 
 @dataclass(frozen=True)

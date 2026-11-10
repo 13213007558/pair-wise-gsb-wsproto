@@ -4,6 +4,13 @@ Release History
 1.4.0 (unreleased)
 ------------------
 
+- Add ``wsproto.h2.H2Handshake``, a library-independent RFC 8441 extended
+  CONNECT adapter that exchanges structured HTTP/2 header/data/stream events
+  with the calling transport and reuses ``Connection`` for WebSocket framing.
+  Each HTTP/2 stream gets an independent adapter, so stream end and RST_STREAM
+  are handled per stream and never affect other streams.
+- Add the optional ``scheme`` field to ``wsproto.events.Request`` for the
+  RFC 8441 ``:scheme`` pseudo-header (defaults to ``https``).
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
 
