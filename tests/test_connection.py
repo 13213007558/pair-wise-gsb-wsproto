@@ -156,6 +156,8 @@ def test_frame_protocol_gets_fed_garbage() -> None:
     event = next(client.events())
     assert isinstance(event, CloseConnection)
     assert event.code == CloseReason.PROTOCOL_ERROR
+    # RFC 6455 section 7.2: a protocol error fails the connection immediately.
+    assert client.state is ConnectionState.CLOSED
 
 
 def test_send_invalid_event() -> None:
@@ -169,3 +171,154 @@ def test_receive_data_when_closed() -> None:
     client._state = ConnectionState.CLOSED
     with pytest.raises(LocalProtocolError):
         client.receive_data(b"something")
+
+
+# ---------------------------------------------------------------------------
+# Event draining and lazy state transitions.
+#
+# These tests deliberately keep using the *same* Connection object: rebuilding
+# a Connection after every receive_data() would hide the state carried by the
+# un-exhausted events() generator and the internal frame parser.
+# ---------------------------------------------------------------------------
+
+
+def _text_frame(payload: str) -> bytes:
+    raw = payload.encode("utf-8")
+    return b"\x81" + bytes([len(raw)]) + raw
+
+
+def _close_frame(code: int = 1000, reason: str = "bye") -> bytes:
+    payload = code.to_bytes(2, "big") + reason.encode("utf-8")
+    return b"\x88" + bytes([len(payload)]) + payload
+
+
+def test_remote_close_state_moves_when_event_is_yielded() -> None:
+    # Documented lazy semantics: receive_data() alone must not change state.
+    client = Connection(CLIENT)
+    client.receive_data(_close_frame())
+    assert client.state is ConnectionState.OPEN
+
+    event = next(client.events())
+    assert isinstance(event, CloseConnection)
+    assert client.state is ConnectionState.REMOTE_CLOSING
+
+
+def test_partial_drain_keeps_state_open_until_close_is_consumed() -> None:
+    # Reproduces the reported trap: a data frame followed by a close frame in
+    # one buffer. Reading only the first event leaves the connection OPEN, so a
+    # business send is still accepted; draining the close then closes the door.
+    client = Connection(CLIENT)
+    client.receive_data(_text_frame("hi") + _close_frame())
+
+    first = next(client.events())
+    assert isinstance(first, TextMessage)
+    assert client.state is ConnectionState.OPEN
+    # The library cannot know the close frame is pending until its event is
+    # consumed, so this send succeeds by design.
+    client.send(BytesMessage(data=b"while-open"))
+
+    second = next(client.events())
+    assert isinstance(second, CloseConnection)
+    assert client.state is ConnectionState.REMOTE_CLOSING
+    with pytest.raises(LocalProtocolError):
+        client.send(BytesMessage(data=b"after-close"))
+
+
+def test_full_drain_blocks_business_send() -> None:
+    # The same input, correctly drained, exposes REMOTE_CLOSING before send().
+    client = Connection(CLIENT)
+    client.receive_data(_text_frame("hi") + _close_frame())
+
+    events = list(client.events())
+    assert [type(event).__name__ for event in events] == [
+        "TextMessage",
+        "CloseConnection",
+    ]
+    assert client.state is ConnectionState.REMOTE_CLOSING
+    with pytest.raises(LocalProtocolError):
+        client.send(BytesMessage(data=b"nope"))
+
+
+def test_recreated_event_iterator_does_not_duplicate_close() -> None:
+    # Dropping an un-exhausted generator and creating a new one must resume
+    # rather than replay: the close is delivered exactly once.
+    client = Connection(CLIENT)
+    client.receive_data(_text_frame("hi") + _close_frame())
+
+    first = next(client.events())
+    assert isinstance(first, TextMessage)
+
+    rest = list(client.events())
+    assert len(rest) == 1
+    assert isinstance(rest[0], CloseConnection)
+    assert client.state is ConnectionState.REMOTE_CLOSING
+    assert list(client.events()) == []
+
+
+def test_data_after_close_frame_is_never_exposed() -> None:
+    # RFC 6455 section 5.5.1: data frames after a close frame are ignored. The
+    # frame processor stops at CLOSE, so no business data leaks out.
+    client = Connection(CLIENT)
+    client.receive_data(_close_frame() + _text_frame("late"))
+
+    events = list(client.events())
+    assert [type(event).__name__ for event in events] == ["CloseConnection"]
+    assert client.state is ConnectionState.REMOTE_CLOSING
+    assert list(client.events()) == []
+
+
+def test_remote_close_after_local_close_reaches_closed() -> None:
+    client = Connection(CLIENT)
+    client.send(CloseConnection(code=CloseReason.NORMAL_CLOSURE))
+    assert client.state is ConnectionState.LOCAL_CLOSING
+
+    # State only advances when the remote close event is actually consumed.
+    client.receive_data(_close_frame())
+    assert client.state is ConnectionState.LOCAL_CLOSING
+
+    event = next(client.events())
+    assert isinstance(event, CloseConnection)
+    assert client.state is ConnectionState.CLOSED
+    with pytest.raises(LocalProtocolError):
+        client.send(BytesMessage(data=b"late"))
+
+
+def test_eof_with_buffered_events_delivers_data_then_close_once() -> None:
+    # EOF (receive_data(None)) while events are only half read. Buffered
+    # business data is delivered first, then a single abnormal CloseConnection.
+    client = Connection(CLIENT)
+    client.receive_data(_text_frame("hi"))
+    first = next(client.events())
+    assert isinstance(first, TextMessage)
+
+    client.receive_data(None)
+    assert client.state is ConnectionState.CLOSED
+
+    events = list(client.events())
+    assert len(events) == 1
+    assert isinstance(events[0], CloseConnection)
+    assert events[0].code is CloseReason.ABNORMAL_CLOSURE
+    # Re-iterating must not redeliver the synthetic close.
+    assert list(client.events()) == []
+    with pytest.raises(LocalProtocolError):
+        client.send(BytesMessage(data=b"orphan"))
+
+
+def test_parse_failure_closes_connection_and_blocks_business_send() -> None:
+    # A remote protocol violation yields a CloseConnection and must fail the
+    # connection immediately (RFC 6455 section 7.2), not leave it OPEN.
+    client = Connection(CLIENT)
+    client.receive_data(_text_frame("hi") + b"\x8f\x00")  # invalid opcode 0xF
+
+    events = list(client.events())
+    assert [type(event).__name__ for event in events] == [
+        "TextMessage",
+        "CloseConnection",
+    ]
+    assert events[1].code is CloseReason.PROTOCOL_ERROR
+    assert client.state is ConnectionState.CLOSED
+    assert list(client.events()) == []
+    with pytest.raises(LocalProtocolError):
+        client.send(BytesMessage(data=b"blocked"))
+    with pytest.raises(LocalProtocolError):
+        client.receive_data(b"more bytes")

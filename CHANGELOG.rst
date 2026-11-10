@@ -6,6 +6,11 @@ Release History
 
 - Require ``event_hint`` when constructing ``RemoteProtocolError``.
   This is an API-breaking change.
+- Move the connection to ``CLOSED`` when a remote protocol error
+  (``ParseFailed``) yields a synthetic ``CloseConnection``, so business
+  messages can no longer be sent after a protocol violation (RFC 6455
+  section 7.2). The transition happens when the event is yielded, matching
+  the lazy state updates used for received close frames.
 
 1.3.2 (2025-11-20)
 ------------------

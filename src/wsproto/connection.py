@@ -162,6 +162,10 @@ class Connection:
         remote :class:`~wsproto.events.CloseConnection` event moves the
         connection into
         :attr:`~wsproto.connection.ConnectionState.REMOTE_CLOSING`.
+        A :class:`~wsproto.events.CloseConnection` event synthesised from a
+        protocol error instead moves the connection directly into
+        :attr:`~wsproto.connection.ConnectionState.CLOSED`, since RFC 6455
+        section 7.2 requires the connection to fail immediately.
 
         :returns: generator of :class:`Event <wsproto.events.Event>` subclasses
         """
@@ -210,4 +214,10 @@ class Connection:
                 else:
                     pass  # pragma: no cover
         except ParseFailed as exc:
+            # RFC 6455 section 7.2: a protocol error fails the WebSocket
+            # connection immediately, rather than starting a closing
+            # handshake. Move to CLOSED at the same moment the synthetic
+            # CloseConnection event is yielded, mirroring the lazy state
+            # transition used for a received close frame.
+            self._state = ConnectionState.CLOSED
             yield CloseConnection(code=exc.code, reason=str(exc))

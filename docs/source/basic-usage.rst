@@ -195,6 +195,37 @@ data and then tear down the underlying connection.
     Both client and server connections must remember to reply to
     ``CloseConnection`` events initiated by the remote party.
 
+Draining events before sending
+------------------------------
+
+State changes caused by received frames are applied lazily, while the
+generator returned by :meth:`WSConnection.events` is consumed -- not when the
+bytes are handed to :meth:`WSConnection.receive_data`. In particular, the
+connection only enters ``REMOTE_CLOSING`` when the corresponding
+``CloseConnection`` event is actually yielded.
+
+Because a single ``receive_data()`` call can buffer several frames (for
+example a data frame followed by a close frame), reading just the first event
+with ``next(ws.events())`` leaves the connection looking ``OPEN`` even though
+a close frame is already queued. A business ``send()`` attempted at that point
+is accepted, even though the peer is closing. Always exhaust the generator
+before deciding what to send::
+
+    ws.receive_data(sock.recv(4096))
+    for event in ws.events():       # consume every queued event
+        ...
+
+After the loop, ``ws.state`` reflects every frame received so far, so gate
+business messages on the connection still being ``OPEN``; in any closing
+state only a ``CloseConnection`` reply is legal and a business ``send()``
+raises :class:`~wsproto.utilities.LocalProtocolError`. Dropping an
+un-exhausted generator and calling ``events()`` again is safe: the new
+generator resumes where the old one stopped and never replays an event.
+
+A ``CloseConnection`` event synthesised from a remote protocol error moves the
+connection directly to ``CLOSED`` (RFC 6455 section 7.2). It must not be
+answered with business data; tear the connection down instead.
+
 Ping Pong
 ---------
 
